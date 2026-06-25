@@ -779,6 +779,51 @@ def get_youtube_client():
     return build("youtube", "v3", credentials=creds)
 
 
+# ── TITEL-OPTIMIERUNG: REISSERISCHER, CLIFFHANGER-TITEL (FÜR MEHR CTR) ────────
+def generate_clickbait_title(topic: str, script: str, is_short: bool) -> str:
+    """Lässt Gemini einen reißerischen, aber wahrheitsgemäßen YouTube-Titel
+    aus dem Thema + Skript bauen. Ziel: höhere Click-Through-Rate, ohne zu
+    lügen oder Inhalte zu verfälschen (Clickbait im positiven Sinne)."""
+    print(f"\n🎯 Erstelle reißerischen Titel (für höhere CTR)...")
+
+    try:
+        genai.configure(api_key=GEMINI_KEY)
+        model = genai.GenerativeModel("gemini-flash-lite-latest")
+
+        kind = "YouTube Short (1-2 Min, cartoon-artig)" if is_short else "YouTube Long-Form Video (10 Min)"
+
+        prompt = f"""Du bist Experte für virale YouTube-Titel im True-Crime-Bereich.
+
+Fall/Thema: {topic}
+Video-Typ: {kind}
+
+Auszug aus dem Skript (für Kontext, NICHT direkt zitieren):
+{script[:600]}
+
+Schreibe EINEN einzigen, maximal 65 Zeichen langen deutschen YouTube-Titel,
+der:
+- Neugier erzeugt / einen Cliffhanger andeutet (z.B. "...dann passierte DAS")
+- Emotional/dramatisch ist, aber NICHT lügt oder den Inhalt verfälscht
+- KEINE Übertreibungen erfindet, die im Skript nicht vorkommen
+- Optional 1 passendes Emoji enthält (nicht mehr als 1)
+- Den echten Namen/Fall aus dem Thema erkennbar lässt
+
+Antworte NUR mit dem Titel selbst, nichts anderes, keine Anführungszeichen."""
+
+        response = model.generate_content(prompt)
+        title = response.text.strip().strip('"').strip()
+        first_line = next((ln.strip() for ln in title.split("\n") if ln.strip()), "")
+
+        if first_line and len(first_line) <= 80:
+            print(f"   ✅ Titel: {first_line}")
+            return first_line
+    except Exception as e:
+        print(f"   ⚠️  Titel-Generierung fehlgeschlagen, nutze Standard-Titel: {e}")
+
+    # Fallback: bisheriger, neutraler Titel-Stil
+    return topic
+
+
 def upload_to_youtube(video_path: str, thumbnail_path: str,
                       topic: str, script: str, is_short: bool = False) -> str:
     print(f"\n📤 Lade auf YouTube hoch...")
@@ -790,11 +835,15 @@ def upload_to_youtube(video_path: str, thumbnail_path: str,
         topic = f"Ungelöster Kriminalfall – Folge {datetime.now().strftime('%Y%m%d-%H%M')}"
     topic = topic.strip()[:70]
 
+    # Reißerischen Titel generieren (für höhere CTR) – fällt auf "topic" zurück,
+    # falls das mal fehlschlägt
+    catchy_topic = generate_clickbait_title(topic, script, is_short)
+
     # Automatische Beschreibung
     intro = re.sub(r'\[.*?\]', '', script)[:350].strip()
 
     if is_short:
-        title = f"🔴 {topic} #Shorts"
+        title = f"🔴 {catchy_topic} #Shorts"
         description = f"""{intro}...
 
 🔔 Folge für mehr True Crime Shorts!
@@ -806,7 +855,7 @@ Alle Fakten basieren auf öffentlich zugänglichen Quellen.
         tags = ["true crime", "shorts", "mystery", "kriminalfall",
                 "deutsch", "krimi", "cartoon", "storytime"]
     else:
-        title = f"🔴 {topic} | True Crime Deutsch"
+        title = f"🔴 {catchy_topic}"
         description = f"""{intro}...
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
