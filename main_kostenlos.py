@@ -44,7 +44,7 @@ import google.generativeai as genai
 import edge_tts
 from moviepy.editor import (
     VideoFileClip, AudioFileClip, concatenate_videoclips,
-    CompositeAudioClip
+    CompositeAudioClip, ImageClip, CompositeVideoClip
 )
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from googleapiclient.discovery import build
@@ -62,6 +62,9 @@ PEXELS_KEY = os.getenv("PEXELS_KEY")
 # Edge TTS Stimme – Deutsch, dunkel & professionell (komplett kostenlos!)
 # Weitere Stimmen: de-DE-ConradNeural, de-AT-JonasNeural, de-DE-KillianNeural
 VOICE = "de-DE-KillianNeural"
+
+# Stimme für die Shorts – energischer/jünger (passt zu "spannend + leicht lustig")
+VOICE_SHORT = "de-DE-FlorianMultilingualNeural"
 
 # YouTube API
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
@@ -106,17 +109,49 @@ Fallname – Kurze packende Beschreibung in 4-8 Wörtern
 Beispiel: Der Fall Madeleine McCann – Spurlos verschwunden in Portugal"""
 
     response = model.generate_content(prompt)
-    topic = response.text.strip().strip('"').strip()
+    topic = _extract_topic_text(response)
 
     # Sicherheits-Check: falls Gemini doch ein Duplikat vorschlägt, nochmal versuchen
     attempts = 0
-    while topic in used_topics and attempts < 3:
+    while (not topic or topic in used_topics) and attempts < 3:
         response = model.generate_content(prompt)
-        topic = response.text.strip().strip('"').strip()
+        topic = _extract_topic_text(response)
         attempts += 1
+
+    # Letzte Absicherung: falls Gemini partout keinen brauchbaren Text liefert
+    # (z.B. wegen Safety-Filtern), nehmen wir ein generisches Fallback-Thema,
+    # damit der Upload nie mit einem leeren Titel fehlschlägt.
+    if not topic:
+        fallback_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+        topic = f"Ungelöster Kriminalfall – Folge {fallback_id}"
+        print(f"   ⚠️  Gemini lieferte kein brauchbares Thema, nutze Fallback: {topic}")
 
     print(f"   ✅ Neues Thema gefunden: {topic}")
     return topic
+
+
+def _extract_topic_text(response) -> str:
+    """Holt sicher den Text aus einer Gemini-Antwort, ohne bei leeren/blockierten
+    Antworten eine Exception zu werfen. YouTube-Titel sind auf 100 Zeichen
+    begrenzt, daher kürzen wir hier zur Sicherheit auf 95 Zeichen."""
+    try:
+        text = response.text.strip().strip('"').strip()
+    except Exception:
+        return ""
+
+    if not text:
+        return ""
+
+    # Manchmal antwortet Gemini mit mehreren Zeilen trotz Anweisung –
+    # nur die erste nicht-leere Zeile als Thema verwenden
+    first_line = next((ln.strip() for ln in text.split("\n") if ln.strip()), "")
+
+    # YouTube-Titel-Limit ist 100 Zeichen; wir geben uns 5 Zeichen Puffer
+    # (für das "🔴 " Präfix und " #Shorts"/" | True Crime Deutsch" Suffix)
+    if len(first_line) > 70:
+        first_line = first_line[:70].rsplit(" ", 1)[0]
+
+    return first_line
 
 # ── SCHRITT 1: SKRIPT MIT GEMINI (KOSTENLOS) ──────────────────────────────────
 def generate_script(topic: str) -> str:
@@ -164,13 +199,62 @@ Schreibe NUR das Skript, keine Erklärungen oder Kommentare davor/danach."""
     return script
 
 
+# ── SCHRITT 1b: KURZES SKRIPT FÜR SHORTS (1-2 MIN, SPANNEND + LUSTIG) ─────────
+def generate_short_script(topic: str) -> str:
+    """Erstellt ein knackiges Short-Skript mit ungewöhnlicher Verbindung als Hook."""
+    print(f"\n📝 Generiere SHORT-Skript mit Gemini (kostenlos)...")
+    print(f"   Thema: {topic}")
+
+    genai.configure(api_key=GEMINI_KEY)
+    model = genai.GenerativeModel("gemini-flash-lite-latest")
+
+    prompt = f"""Du bist ein viraler True-Crime-Shorts-Creator auf YouTube/TikTok.
+Schreibe ein KURZES, knackiges Skript über: {topic}
+
+ANFORDERUNGEN:
+- Nur 140-190 Wörter GESAMT (= ca. 60-90 Sekunden gesprochen)
+- HOOK MUSS eine "ungewöhnliche Verbindung" sein – verbinde den Killer/Fall mit
+  etwas banalem oder unerwartetem Alltagsding, z.B.
+  "Dieser Mann liebte Eis am Stiel – und tötete 7 Menschen." Erfinde eine
+  ECHTE, dokumentierte schrullige Marotte/Vorliebe der Person für den Hook,
+  keine Erfindung wenn nicht belegt – sonst eine andere überraschende Tatsache.
+- Ton: spannend, mysteriös, mit einem klaren Schuss leichtem, dunklem Humor
+  (KEIN Verharmlosen der Opfer – der Humor liegt im Erzählstil/Timing, nicht
+  am Verbrechen selbst)
+- Kurze, knackige Sätze. Viele Cliffhanger-Wörter ("Aber dann...", "Niemand
+  wusste...", "Bis heute...")
+- Schluss MUSS ein offener Cliffhanger oder eine gruselige Pointe sein, die
+  zum Folgen/Abonnieren animiert
+
+STRUKTUR – nutze diese exakten Marker:
+[HOOK]
+(1-2 Sätze, die ungewöhnliche Verbindung)
+
+[STORY]
+(Die Kerngeschichte kompakt erzählt, 3-5 Sätze)
+
+[TWIST]
+(Eine überraschende Wendung oder der ungelöste Rest)
+
+[OUTRO]
+(1 Satz, der zum Abonnieren/Folgen für mehr Cases auffordert)
+
+Schreibe NUR das Skript, keine Erklärungen davor oder danach."""
+
+    response = model.generate_content(prompt)
+    script = response.text
+    print(f"   ✅ Short-Skript fertig! ({len(script.split())} Wörter)")
+    return script
+
+
 # ── SCHRITT 2: VOICEOVER MIT EDGE TTS (100% KOSTENLOS) ────────────────────────
-async def create_voiceover_async(text: str, output_path: str):
+async def create_voiceover_async(text: str, output_path: str, voice: str, rate: str, pitch: str):
     """Edge TTS ist komplett kostenlos – von Microsoft"""
-    communicate = edge_tts.Communicate(text, VOICE, rate="+5%", pitch="-10Hz")
+    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
     await communicate.save(output_path)
 
-def create_voiceover(script: str, output_path: str) -> float:
+def create_voiceover(script: str, output_path: str, voice: str = VOICE,
+                      rate: str = "+5%", pitch: str = "-10Hz") -> float:
     print(f"\n🎙️  Erstelle Voiceover mit Edge TTS (kostenlos)...")
 
     # Regieanweisungen [IN KLAMMERN] entfernen
@@ -178,7 +262,7 @@ def create_voiceover(script: str, output_path: str) -> float:
     clean = re.sub(r'\n{3,}', '\n\n', clean).strip()
 
     # Async ausführen
-    asyncio.run(create_voiceover_async(clean, output_path))
+    asyncio.run(create_voiceover_async(clean, output_path, voice, rate, pitch))
 
     # Länge messen
     audio = AudioFileClip(output_path)
@@ -187,6 +271,261 @@ def create_voiceover(script: str, output_path: str) -> float:
 
     print(f"   ✅ Voiceover fertig! ({duration/60:.1f} Minuten)")
     return duration
+
+
+# ── SCHRITT 2b: VOICEOVER MIT WORT-ZEITSTEMPELN (NUR FÜR SHORTS-UNTERTITEL) ───
+async def create_voiceover_with_timings_async(text: str, output_path: str,
+                                               voice: str, rate: str, pitch: str) -> list:
+    """Wie create_voiceover_async, sammelt aber zusätzlich pro Wort den exakten
+    Start-Zeitpunkt (für TikTok-Style Wort-für-Wort-Untertitel bei Shorts)."""
+    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+    word_timings = []  # Liste von {"word": str, "start": Sekunden, "end": Sekunden}
+
+    with open(output_path, "wb") as audio_file:
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_file.write(chunk["data"])
+            elif chunk["type"] == "WordBoundary":
+                # offset/duration kommen in 100-Nanosekunden-Einheiten von Edge TTS
+                start = chunk["offset"] / 10_000_000
+                dur = chunk["duration"] / 10_000_000
+                word_timings.append({
+                    "word": chunk["text"],
+                    "start": start,
+                    "end": start + dur,
+                })
+
+    return word_timings
+
+def create_voiceover_with_timings(script: str, output_path: str, voice: str,
+                                   rate: str = "+15%", pitch: str = "+5Hz") -> tuple:
+    """Erstellt das Voiceover + gibt (duration, word_timings) zurück.
+    Wird nur für Shorts genutzt, damit Untertitel Wort-für-Wort synchron laufen."""
+    print(f"\n🎙️  Erstelle Voiceover mit Wort-Zeitstempeln (kostenlos)...")
+
+    clean = re.sub(r'\[.*?\]', '', script)
+    clean = re.sub(r'\n{3,}', '\n\n', clean).strip()
+
+    word_timings = asyncio.run(
+        create_voiceover_with_timings_async(clean, output_path, voice, rate, pitch)
+    )
+
+    audio = AudioFileClip(output_path)
+    duration = audio.duration
+    audio.close()
+
+    print(f"   ✅ Voiceover fertig! ({duration:.1f} Sek, {len(word_timings)} Wörter erfasst)")
+    return duration, word_timings
+
+
+# ── SCHRITT 3b: CARTOON-BILDER FÜR SHORTS MIT GEMINI (NANO BANANA, KOSTENLOS) ──
+def generate_cartoon_scenes(topic: str, script: str, num_scenes: int = 5) -> list:
+    """Lässt Gemini's Bildmodell ein paar Cartoon-Szenenbilder zum Fall erstellen.
+    Nutzt den selben kostenlosen GEMINI_KEY (Google AI Studio Free Tier)."""
+    print(f"\n🎨 Erstelle {num_scenes} Cartoon-Szenenbilder (Gemini, kostenlos)...")
+
+    genai.configure(api_key=GEMINI_KEY)
+    image_model = genai.GenerativeModel("gemini-2.5-flash-image")
+
+    # Kurze Szenen-Beschreibungen aus dem Skript ableiten lassen (Text-Modell)
+    text_model = genai.GenerativeModel("gemini-flash-lite-latest")
+    scene_prompt = f"""Lies dieses kurze True-Crime-Skript über "{topic}":
+
+{script}
+
+Erstelle GENAU {num_scenes} kurze, visuelle Szenen-Beschreibungen (je 1 Satz,
+auf Englisch, für einen Cartoon-Bildgenerator), die den Ablauf der Geschichte
+illustrieren. Stil: harmloser, leicht düsterer Cartoon/Comic-Look, NICHT
+grafisch oder blutig, geeignet für YouTube Shorts (keine Altersbeschränkung).
+Antworte NUR als Liste, eine Szene pro Zeile, ohne Nummerierung."""
+
+    response = text_model.generate_content(scene_prompt)
+    scenes = [s.strip("- ").strip() for s in response.text.strip().split("\n") if s.strip()]
+    scenes = scenes[:num_scenes]
+
+    image_paths = []
+    for i, scene in enumerate(scenes):
+        try:
+            prompt = (
+                f"Flat 2D cartoon illustration, true-crime documentary style, "
+                f"muted dark color palette, simple shapes, NOT graphic or bloody, "
+                f"safe for all audiences, vertical composition: {scene}"
+            )
+            result = image_model.generate_content(prompt)
+            for part in result.candidates[0].content.parts:
+                if hasattr(part, "inline_data") and part.inline_data:
+                    img_path = f"tmp/scene_{i}.png"
+                    with open(img_path, "wb") as f:
+                        f.write(part.inline_data.data)
+                    image_paths.append(img_path)
+                    break
+        except Exception as e:
+            print(f"   ⚠️  Szene {i+1} fehlgeschlagen: {e}")
+            continue
+
+    print(f"   ✅ {len(image_paths)} Cartoon-Bilder erstellt!")
+    return image_paths
+
+
+# ── HILFSFUNKTION: TIKTOK-STYLE WORT-UNTERTITEL AUS ZEITSTEMPELN BAUEN ────────
+def _build_word_caption_clips(word_timings: list, video_w: int, video_h: int) -> list:
+    """Erstellt für jedes Wort einen kurzen TextClip (gelb, fett, mit schwarzem
+    Rand), der exakt dann erscheint, wenn das Wort gesprochen wird – wie bei
+    TikTok/Shorts üblich. NUR für Shorts gedacht."""
+    caption_clips = []
+
+    # Sicherheitsbremse: bei einem 60-90 Sek Short sind realistisch ~300 Wörter
+    # das Maximum. Mehr deutet auf ein TTS-Problem hin – dann lieber abschneiden
+    # statt das Rendering unnötig zu verlangsamen.
+    word_timings = word_timings[:300]
+
+    for wt in word_timings:
+        word = wt["word"].strip()
+        if not word:
+            continue
+        start = wt["start"]
+        end = wt["end"]
+        dur = max(end - start, 0.08)  # Mindestdauer, falls Wort sehr kurz ist
+
+        # Pro Wort ein PNG mit Pillow rendern (zuverlässiger als ImageMagick/TextClip)
+        txt_img = Image.new("RGBA", (video_w, 400), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(txt_img)
+        try:
+            font = ImageFont.truetype("C:/Windows/Fonts/impact.ttf", 90)
+        except Exception:
+            try:
+                font = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 90)
+            except Exception:
+                font = ImageFont.load_default()
+
+        display_word = word.upper()
+        bbox = draw.textbbox((0, 0), display_word, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        tx = (video_w - tw) // 2
+        ty = (400 - th) // 2
+
+        # Schwarzer Rand (Outline) für Lesbarkeit auf jedem Hintergrund
+        for dx in (-4, -2, 0, 2, 4):
+            for dy in (-4, -2, 0, 2, 4):
+                draw.text((tx + dx, ty + dy), display_word, font=font, fill=(0, 0, 0, 255))
+        # Gelber Text obendrauf (YouTube-Shorts-Style)
+        draw.text((tx, ty), display_word, font=font, fill=(255, 220, 0, 255))
+
+        word_idx = len(caption_clips)
+        tmp_word_path = f"tmp/word_{word_idx}.png"
+        txt_img.save(tmp_word_path)
+
+        clip = (
+            ImageClip(tmp_word_path)
+            .set_start(start)
+            .set_duration(dur)
+            .set_position(("center", int(video_h * 0.72)))  # unteres Drittel
+        )
+        caption_clips.append(clip)
+
+    return caption_clips
+
+
+# ── SCHRITT 4b: SHORT-VIDEO ZUSAMMENBAUEN (9:16, CARTOON-BILDER + ZOOM) ───────
+def create_short_video(audio_path: str, image_paths: list, output_path: str,
+                        meme_lines: list = None, word_timings: list = None):
+    """Baut ein vertikales Short-Video aus Cartoon-Standbildern mit
+    sanftem Zoom-Effekt (Ken-Burns) + optional ein paar Meme-Textzeilen +
+    Wort-für-Wort-Untertitel (gelb, TikTok-Style), falls word_timings übergeben."""
+    print(f"\n🎞️  Baue Short-Video zusammen (9:16)...")
+
+    if not image_paths:
+        raise Exception("Keine Cartoon-Bilder zum Erstellen des Shorts vorhanden!")
+
+    audio = AudioFileClip(audio_path)
+    total_duration = audio.duration
+    per_image = total_duration / len(image_paths)
+
+    W, H = 1080, 1920  # 9:16 Shorts-Format
+    clips = []
+
+    for idx, img_path in enumerate(image_paths):
+        img = Image.open(img_path).convert("RGB")
+
+        # Bild zentriert auf 9:16 zuschneiden/skalieren (Cover-Fit)
+        img_ratio = img.width / img.height
+        target_ratio = W / H
+        if img_ratio > target_ratio:
+            new_height = img.height
+            new_width = int(new_height * target_ratio)
+            left = (img.width - new_width) // 2
+            img = img.crop((left, 0, left + new_width, new_height))
+        else:
+            new_width = img.width
+            new_height = int(new_width / target_ratio)
+            top = (img.height - new_height) // 2
+            img = img.crop((0, top, new_width, top + new_height))
+        img = img.resize((W, H), Image.LANCZOS)
+
+        # Ein paar Memes/Untertitel auf ausgewählte Bilder (nicht zu viele)
+        if meme_lines and idx < len(meme_lines) and meme_lines[idx]:
+            draw = ImageDraw.Draw(img)
+            try:
+                font = ImageFont.truetype("C:/Windows/Fonts/impact.ttf", 64)
+            except Exception:
+                try:
+                    font = ImageFont.truetype(
+                        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 64)
+                except Exception:
+                    font = ImageFont.load_default()
+
+            text = meme_lines[idx].upper()
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw = bbox[2] - bbox[0]
+            tx = (W - tw) // 2
+            ty = H - 320
+            for dx in (-3, 0, 3):
+                for dy in (-3, 0, 3):
+                    draw.text((tx + dx, ty + dy), text, font=font, fill="black")
+            draw.text((tx, ty), text, font=font, fill="white")
+
+        tmp_img_path = f"tmp/scene_render_{idx}.png"
+        img.save(tmp_img_path)
+
+        clip = (
+            ImageClip(tmp_img_path)
+            .set_duration(per_image)
+            .resize(lambda t, d=per_image: 1.0 + 0.08 * (t / d))  # sanfter Zoom
+            .set_position(("center", "center"))
+        )
+        clip = CompositeVideoClip([clip], size=(W, H)).set_duration(per_image)
+        clips.append(clip)
+
+    background_video = concatenate_videoclips(clips, method="compose")
+    background_video = background_video.subclip(0, total_duration)
+
+    # Wort-für-Wort-Untertitel als zusätzliche Ebene drüberlegen (NUR Shorts)
+    if word_timings:
+        print(f"   💬 Füge {len(word_timings)} Wort-Untertitel hinzu...")
+        caption_clips = _build_word_caption_clips(word_timings, W, H)
+        final_video = CompositeVideoClip(
+            [background_video] + caption_clips, size=(W, H)
+        )
+    else:
+        final_video = background_video
+
+    final_video = final_video.set_audio(audio)
+    final_video = final_video.subclip(0, total_duration)
+
+    print(f"   💾 Exportiere Short...")
+    final_video.write_videofile(
+        output_path, codec="libx264", audio_codec="aac",
+        fps=30, preset="medium", verbose=False, logger=None
+    )
+
+    for c in clips:
+        try:
+            c.close()
+        except Exception:
+            pass
+    audio.close()
+    print(f"   ✅ Short-Video fertig!")
 
 
 # ── SCHRITT 3: STOCK-VIDEOS VON PEXELS (KOSTENLOS) ────────────────────────────
@@ -441,13 +780,34 @@ def get_youtube_client():
 
 
 def upload_to_youtube(video_path: str, thumbnail_path: str,
-                      topic: str, script: str) -> str:
+                      topic: str, script: str, is_short: bool = False) -> str:
     print(f"\n📤 Lade auf YouTube hoch...")
     youtube = get_youtube_client()
 
+    # Letzte Absicherung: niemals mit leerem/zu langem Titel hochladen,
+    # auch falls topic aus irgendeinem Grund leer oder None ankommt
+    if not topic or not topic.strip():
+        topic = f"Ungelöster Kriminalfall – Folge {datetime.now().strftime('%Y%m%d-%H%M')}"
+    topic = topic.strip()[:70]
+
     # Automatische Beschreibung
     intro = re.sub(r'\[.*?\]', '', script)[:350].strip()
-    description = f"""{intro}...
+
+    if is_short:
+        title = f"🔴 {topic} #Shorts"
+        description = f"""{intro}...
+
+🔔 Folge für mehr True Crime Shorts!
+
+⚠️ Dieses Video wurde mit KI-Unterstützung erstellt (Cartoon-Darstellung).
+Alle Fakten basieren auf öffentlich zugänglichen Quellen.
+
+#TrueCrime #Shorts #Mystery #Krimi #Deutsch"""
+        tags = ["true crime", "shorts", "mystery", "kriminalfall",
+                "deutsch", "krimi", "cartoon", "storytime"]
+    else:
+        title = f"🔴 {topic} | True Crime Deutsch"
+        description = f"""{intro}...
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 🔔 ABONNIERE für wöchentliche True Crime Stories!
@@ -467,14 +827,15 @@ def upload_to_youtube(video_path: str, thumbnail_path: str,
 Alle Fakten basieren auf öffentlich zugänglichen Quellen.
 
 #TrueCrime #Mystery #Krimi #Deutsch #Ungeklärt #Dokumentation #Verbrechen"""
+        tags = ["true crime", "mystery", "kriminalfall", "ungeklärt",
+                "deutsch", "dokumentation", "mord", "verbrechen",
+                "krimi", "investigation"]
 
     body = {
         "snippet": {
-            "title": f"🔴 {topic} | True Crime Deutsch",
+            "title": title,
             "description": description,
-            "tags": ["true crime", "mystery", "kriminalfall", "ungeklärt",
-                    "deutsch", "dokumentation", "mord", "verbrechen",
-                    "krimi", "investigation"],
+            "tags": tags,
             "categoryId": "25",
             "defaultLanguage": "de",
         },
@@ -504,12 +865,13 @@ Alle Fakten basieren auf öffentlich zugänglichen Quellen.
     video_id = response["id"]
     print(f"\n   ✅ Video live! → https://youtube.com/watch?v={video_id}")
 
-    # Thumbnail setzen
-    youtube.thumbnails().set(
-        videoId=video_id,
-        media_body=MediaFileUpload(thumbnail_path, mimetype="image/jpeg")
-    ).execute()
-    print("   ✅ Thumbnail gesetzt!")
+    # Thumbnail nur bei Long-Form setzen (Shorts brauchen i.d.R. kein eigenes Thumbnail)
+    if not is_short and thumbnail_path and os.path.exists(thumbnail_path):
+        youtube.thumbnails().set(
+            videoId=video_id,
+            media_body=MediaFileUpload(thumbnail_path, mimetype="image/jpeg")
+        ).execute()
+        print("   ✅ Thumbnail gesetzt!")
 
     return video_id
 
@@ -519,21 +881,31 @@ def main():
     start_time = datetime.now()
     date_str = start_time.strftime("%Y-%m-%d")
 
+    # ── Abwechseln: gerader Kalendertag = Long-Form, ungerader = Short ────────
+    # (robust & einfach: hängt nur am Datum, kein Zähler nötig, der verloren
+    #  gehen könnte zwischen GitHub-Actions-Läufen)
+    day_of_year = start_time.timetuple().tm_yday
+    is_short_day = (day_of_year % 2 == 1)
+
+    video_type = "SHORT (Cartoon, 60-90 Sek)" if is_short_day else "LONG-FORM (10 Min)"
+
     print("=" * 55)
     print("  🔴 TRUE CRIME BOT – KOSTENLOSE VERSION")
     print(f"  📅 {start_time.strftime('%d.%m.%Y %H:%M Uhr')}")
+    print(f"  🎬 Heute: {video_type}")
     print("  💰 Kosten heute: 0€")
     print("=" * 55)
 
-    audio_path  = f"output/voiceover_{date_str}.mp3"
-    video_path  = f"output/video_{date_str}.mp4"
-    thumb_path  = f"output/thumbnail_{date_str}.jpg"
-    script_path = f"output/script_{date_str}.txt"
-    log_path    = f"logs/uploaded_{date_str}.json"
+    suffix = "short" if is_short_day else "long"
+    audio_path  = f"output/voiceover_{date_str}_{suffix}.mp3"
+    video_path  = f"output/video_{date_str}_{suffix}.mp4"
+    thumb_path  = f"output/thumbnail_{date_str}_{suffix}.jpg"
+    script_path = f"output/script_{date_str}_{suffix}.txt"
+    log_path    = f"logs/uploaded_{date_str}_{suffix}.json"
 
-    # Heute schon hochgeladen?
+    # Heute (für diesen Typ) schon hochgeladen?
     if os.path.exists(log_path):
-        print("\n⚠️  Heute wurde bereits ein Video hochgeladen!")
+        print(f"\n⚠️  Heute wurde bereits ein {video_type}-Video hochgeladen!")
         return
 
     try:
@@ -548,22 +920,53 @@ def main():
         topic = generate_unique_topic(used)
         used.add(topic)
 
-        # ── Pipeline ───────────────────────────────────────────────────────────
-        script = generate_script(topic)
-        with open(script_path, "w", encoding="utf-8") as f:
-            f.write(script)
+        if is_short_day:
+            # ── SHORT-PIPELINE ───────────────────────────────────────────────
+            script = generate_short_script(topic)
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(script)
 
-        duration = create_voiceover(script, audio_path)
-        video_sources = fetch_stock_videos(duration)
-        create_video(audio_path, video_sources, video_path)
-        create_thumbnail(topic, thumb_path)
-        video_id = upload_to_youtube(video_path, thumb_path, topic, script)
+            # Wort-Zeitstempel mitsammeln, damit die Untertitel exakt synchron
+            # zur gesprochenen Stimme erscheinen (TikTok-Style, gelb)
+            duration, word_timings = create_voiceover_with_timings(
+                script, audio_path, voice=VOICE_SHORT, rate="+15%", pitch="+5Hz"
+            )
+            scene_images = generate_cartoon_scenes(topic, script, num_scenes=5)
+
+            # Nur die erste und eine mittlere Szene mit Meme-Text versehen
+            # ("ein paar Memes sind ok, aber nicht zu viele")
+            meme_lines = [None] * len(scene_images)
+            if len(scene_images) > 0:
+                meme_lines[0] = "WARTE BIS ZUM ENDE 👀"
+            if len(scene_images) > 2:
+                meme_lines[2] = "DAS GLAUBST DU NICHT"
+
+            create_short_video(
+                audio_path, scene_images, video_path, meme_lines, word_timings
+            )
+            video_id = upload_to_youtube(
+                video_path, None, topic, script, is_short=True
+            )
+        else:
+            # ── LONG-FORM-PIPELINE (wie bisher) ──────────────────────────────
+            script = generate_script(topic)
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(script)
+
+            duration = create_voiceover(script, audio_path)
+            video_sources = fetch_stock_videos(duration)
+            create_video(audio_path, video_sources, video_path)
+            create_thumbnail(topic, thumb_path)
+            video_id = upload_to_youtube(
+                video_path, thumb_path, topic, script, is_short=False
+            )
 
         # Erfolg speichern
         elapsed = (datetime.now() - start_time).seconds // 60
         with open(log_path, "w", encoding="utf-8") as f:
             json.dump({
                 "date": date_str,
+                "type": "short" if is_short_day else "long",
                 "topic": topic,
                 "video_id": video_id,
                 "url": f"https://youtube.com/watch?v={video_id}",
@@ -576,7 +979,7 @@ def main():
 
         # Erfolg ausgeben
         print("\n" + "=" * 55)
-        print("  🎉 FERTIG – Video ist live!")
+        print(f"  🎉 FERTIG – {video_type} ist live!")
         print(f"  🎬 {topic[:45]}...")
         print(f"  🔗 https://youtube.com/watch?v={video_id}")
         print(f"  💰 Kosten: 0€")
