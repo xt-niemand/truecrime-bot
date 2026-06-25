@@ -1,0 +1,59 @@
+name: Daily True Crime Video
+
+# Läuft automatisch jeden Tag + kann manuell gestartet werden
+on:
+  schedule:
+    - cron: '0 17 * * *'   # Täglich um 17:00 UTC = 19:00 Uhr deutsche Zeit
+  workflow_dispatch:        # Erlaubt manuellen Start über den "Run workflow" Button
+
+jobs:
+  create-and-upload-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Dependencies installieren
+        run: pip install -r requirements.txt
+
+      - name: Secrets als Dateien anlegen
+        run: |
+          echo '${{ secrets.CLIENT_SECRET_JSON }}' > client_secret.json
+          echo '${{ secrets.TOKEN_JSON }}' > token.json
+
+      - name: Ordner anlegen
+        run: mkdir -p output tmp logs assets
+
+      - name: Bisherige Themen-Historie wiederherstellen
+        uses: actions/cache@v4
+        with:
+          path: logs/used_topics.json
+          key: used-topics-${{ github.run_id }}
+          restore-keys: |
+            used-topics-
+
+      - name: Bot ausführen
+        env:
+          GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
+          PEXELS_KEY: ${{ secrets.PEXELS_KEY }}
+        run: python main_kostenlos.py
+
+      - name: Aktualisierten YouTube-Token speichern
+        if: always()
+        run: |
+          echo "Hinweis: token.json kann sich erneuert haben."
+          echo "Falls YouTube-Login künftig fehlschlägt, token.json Secret manuell aktualisieren."
+
+      - name: Themen-Historie sichern
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: logs/used_topics.json
+          key: used-topics-${{ github.run_id }}
