@@ -1,0 +1,10 @@
+google-generativeai
+google-genai
+edge-tts
+moviepy==1.0.3
+pillow
+imageio-ffmpeg
+requests
+google-api-python-client
+google-auth-oauthlib
+python-dotenv
