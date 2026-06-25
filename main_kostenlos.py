@@ -418,13 +418,24 @@ def get_youtube_client():
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
+            with open("token.json", "w") as f:
+                f.write(creds.to_json())
         else:
+            # In der Cloud (z.B. GitHub Actions) gibt es keinen Browser für den Login!
+            # Das token.json Secret muss dann lokal neu erzeugt und aktualisiert werden.
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                raise Exception(
+                    "YouTube-Token ist abgelaufen und kann in der Cloud nicht "
+                    "erneuert werden. Bitte token.json lokal neu erstellen "
+                    "(einmal 'python main_kostenlos.py' auf deinem PC laufen "
+                    "lassen) und das TOKEN_JSON Secret auf GitHub aktualisieren."
+                )
             flow = InstalledAppFlow.from_client_secrets_file(
                 "client_secret.json", SCOPES
             )
             creds = flow.run_local_server(port=0)
-        with open("token.json", "w") as f:
-            f.write(creds.to_json())
+            with open("token.json", "w") as f:
+                f.write(creds.to_json())
 
     return build("youtube", "v3", credentials=creds)
 
