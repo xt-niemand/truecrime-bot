@@ -3,7 +3,14 @@ name: Daily True Crime Video
 # Läuft automatisch jeden Tag + kann manuell gestartet werden
 on:
   schedule:
-    - cron: '0 17 * * *'   # Täglich um 17:00 UTC = 19:00 Uhr deutsche Zeit
+    # 15:00 UTC = 17:00 Uhr deutsche Sommerzeit (UTC+2).
+    # Die Pipeline braucht ca. 15-25 Min, daher etwas vor der Ziel-Upload-
+    # Zeit (18 Uhr) starten, damit das Video genau in der Hauptverkehrszeit
+    # (15-21 Uhr laut Studien) online geht – und YouTube etwas Vorlauf zur
+    # Indexierung hat.
+    # ⚠️ Im Winter (UTC+1) verschiebt sich das automatisch um 1h nach hinten
+    # auf 16 Uhr deutsche Zeit – das liegt aber noch passend im Hauptfenster.
+    - cron: '0 15 * * *'
   workflow_dispatch:        # Erlaubt manuellen Start über den "Run workflow" Button
 
 jobs:
