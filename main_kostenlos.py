@@ -24,6 +24,7 @@ import random
 import requests
 import json
 import asyncio
+import time
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -319,9 +320,47 @@ def create_voiceover_with_timings(script: str, output_path: str, voice: str,
 
 
 # ── SCHRITT 3b: CARTOON-BILDER FÜR SHORTS MIT GEMINI (NANO BANANA, KOSTENLOS) ──
+# ── FALLBACK: PEXELS-FOTOS, FALLS DAS KI-BILDMODELL KOMPLETT AUSFÄLLT ─────────
+def _fetch_fallback_photos(scene_descriptions: list, num_needed: int) -> list:
+    """Lädt passende echte Fotos von Pexels (kostenlos) als Ersatz für die
+    Cartoon-Bilder, falls Gemini's Bildmodell sein Tageslimit erreicht hat
+    oder aus einem anderen Grund komplett ausfällt. Besser ein Short mit
+    echten Fotos als gar kein Short."""
+    headers = {"Authorization": PEXELS_KEY}
+    fallback_keywords = ["mystery dark", "crime scene night", "investigation",
+                          "true crime", "detective", "dark city night"]
+    image_paths = []
+
+    for i in range(num_needed):
+        # Erst versuchen, ein zur Szene passendes Stichwort zu nutzen,
+        # sonst eines aus der generischen Liste
+        query = fallback_keywords[i % len(fallback_keywords)]
+        try:
+            params = {"query": query, "per_page": 1, "orientation": "portrait"}
+            res = requests.get("https://api.pexels.com/v1/search",
+                              headers=headers, params=params, timeout=10)
+            if res.status_code == 200:
+                photos = res.json().get("photos", [])
+                if photos:
+                    img_url = photos[0]["src"]["large2x"]
+                    img_data = requests.get(img_url, timeout=15).content
+                    img_path = f"tmp/fallback_{i}.jpg"
+                    with open(img_path, "wb") as f:
+                        f.write(img_data)
+                    image_paths.append(img_path)
+        except Exception as e:
+            print(f"   ⚠️  Fallback-Foto {i+1} fehlgeschlagen: {e}")
+            continue
+
+    print(f"   ✅ {len(image_paths)} Fallback-Fotos von Pexels geladen")
+    return image_paths
+
+
 def generate_cartoon_scenes(topic: str, script: str, num_scenes: int = 5) -> list:
     """Lässt Gemini's Bildmodell ein paar Cartoon-Szenenbilder zum Fall erstellen.
-    Nutzt den selben kostenlosen GEMINI_KEY (Google AI Studio Free Tier)."""
+    Nutzt den selben kostenlosen GEMINI_KEY (Google AI Studio Free Tier).
+    Bei Rate-Limits wird automatisch mit Backoff erneut versucht; schlägt das
+    Bildmodell komplett fehl, greift ein Foto-Fallback über Pexels."""
     print(f"\n🎨 Erstelle {num_scenes} Cartoon-Szenenbilder (Gemini, kostenlos)...")
 
     genai.configure(api_key=GEMINI_KEY)
@@ -345,25 +384,48 @@ Antworte NUR als Liste, eine Szene pro Zeile, ohne Nummerierung."""
 
     image_paths = []
     for i, scene in enumerate(scenes):
-        try:
-            prompt = (
-                f"Flat 2D cartoon illustration, true-crime documentary style, "
-                f"muted dark color palette, simple shapes, NOT graphic or bloody, "
-                f"safe for all audiences, vertical composition: {scene}"
-            )
-            result = image_model.generate_content(prompt)
-            for part in result.candidates[0].content.parts:
-                if hasattr(part, "inline_data") and part.inline_data:
-                    img_path = f"tmp/scene_{i}.png"
-                    with open(img_path, "wb") as f:
-                        f.write(part.inline_data.data)
-                    image_paths.append(img_path)
-                    break
-        except Exception as e:
-            print(f"   ⚠️  Szene {i+1} fehlgeschlagen: {e}")
-            continue
+        prompt = (
+            f"Flat 2D cartoon illustration, true-crime documentary style, "
+            f"muted dark color palette, simple shapes, NOT graphic or bloody, "
+            f"safe for all audiences, vertical composition: {scene}"
+        )
 
-    print(f"   ✅ {len(image_paths)} Cartoon-Bilder erstellt!")
+        # Bis zu 3 Versuche mit Backoff, falls ein Rate-Limit (429) zuschlägt –
+        # das kostenlose Bild-Kontingent ist sehr eng getaktet
+        success = False
+        for attempt in range(3):
+            try:
+                result = image_model.generate_content(prompt)
+                for part in result.candidates[0].content.parts:
+                    if hasattr(part, "inline_data") and part.inline_data:
+                        img_path = f"tmp/scene_{i}.png"
+                        with open(img_path, "wb") as f:
+                            f.write(part.inline_data.data)
+                        image_paths.append(img_path)
+                        success = True
+                        break
+                if success:
+                    break
+            except Exception as e:
+                wait = 20 * (attempt + 1)  # 20s, 40s, 60s – steigender Backoff
+                print(f"   ⚠️  Szene {i+1}, Versuch {attempt+1}/3 fehlgeschlagen: {e}")
+                if attempt < 2:
+                    print(f"   ⏳ Warte {wait}s vor erneutem Versuch...")
+                    time.sleep(wait)
+
+        if not success:
+            print(f"   ❌ Szene {i+1} konnte nicht generiert werden (alle Versuche fehlgeschlagen)")
+
+    # Fallback: falls das Bildmodell komplett ausgefallen ist (z.B. Tageslimit
+    # erreicht), lieber mit echten Pexels-Fotos weitermachen statt zu crashen
+    used_fallback = False
+    if not image_paths:
+        print("   ⚠️  Keine Cartoon-Bilder verfügbar – nutze Pexels-Fotos als Fallback")
+        image_paths = _fetch_fallback_photos(scenes if scenes else [topic], num_scenes)
+        used_fallback = True
+
+    label = "Fallback-Fotos" if used_fallback else "Cartoon-Bilder"
+    print(f"   ✅ {len(image_paths)} {label} erstellt!")
     return image_paths
 
 
@@ -916,11 +978,18 @@ Alle Fakten basieren auf öffentlich zugänglichen Quellen.
 
     # Thumbnail nur bei Long-Form setzen (Shorts brauchen i.d.R. kein eigenes Thumbnail)
     if not is_short and thumbnail_path and os.path.exists(thumbnail_path):
-        youtube.thumbnails().set(
-            videoId=video_id,
-            media_body=MediaFileUpload(thumbnail_path, mimetype="image/jpeg")
-        ).execute()
-        print("   ✅ Thumbnail gesetzt!")
+        try:
+            youtube.thumbnails().set(
+                videoId=video_id,
+                media_body=MediaFileUpload(thumbnail_path, mimetype="image/jpeg")
+            ).execute()
+            print("   ✅ Thumbnail gesetzt!")
+        except Exception as e:
+            # Video ist schon erfolgreich live – ein Thumbnail-Fehler soll den
+            # gesamten Lauf NICHT als gescheitert markieren. Häufigste Ursache:
+            # fehlende Kanal-Berechtigung für benutzerdefinierte Thumbnails.
+            print(f"   ⚠️  Thumbnail konnte nicht gesetzt werden: {e}")
+            print("   ℹ️  Das Video ist trotzdem live, nur ohne eigenes Thumbnail.")
 
     return video_id
 
